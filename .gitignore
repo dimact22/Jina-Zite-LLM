@@ -1,0 +1,9 @@
+# Ignore all scraping result files
+*.md
+!README.md
+*.json
+
+# Ignore Python cache and environment variables
+__pycache__/
+*.pyc
+.env
