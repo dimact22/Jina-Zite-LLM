@@ -1,27 +1,34 @@
 # AI Web Scraper
 
-This project is a smart web scraper. It downloads content from any website using the Jina Reader API, and then uses a Large Language Model (Llama 3 via Groq API) to extract structured information in JSON format (product name, brand, price, target audience). The AI is strictly instructed not to hallucinate: if data is missing, it simply outputs `"I don't know"`.
+This project is a smart web scraper. It downloads content from any website using **Jina Reader API** or **Zyte API**, and then uses a Large Language Model (Llama 3 via Groq) to extract structured information in JSON format.
 
-## How to run it on your PC
+## Setup
 
-1. **Install Python 3** (if not already installed).
-2. **Install the required library**:
-   Open a terminal in the project folder and run:
+1. **Install Python 3**.
+2. **Install requirements**:
    ```bash
-   pip install requests
+   pip install requests markdownify
    ```
-3. **Run the script**:
-   In your terminal, execute:
-   ```bash
-   python scraper.py
-   ```
-   The script will ask you for a URL. Just paste a website link and press Enter.
 
-Alternatively, you can run it with a URL directly:
+## Usage
+
+The new unified `scrape.py` script lets you choose your extraction engine.
+
+### Using Jina (Default)
+Best for basic webpages and articles.
 ```bash
-python scraper.py "https://ridge.com/products/titanium-matte-black"
+python scrape.py "https://ridge.com/products/titanium-matte-black"
 ```
 
-The script will automatically create two files in your folder:
-- A `.md` file containing the raw text of the webpage.
-- A `.json` file containing the structured data extracted by the AI.
+### Using Zyte
+Best for websites with bot-protection, captchas, or heavy JS (Amazon, Nike, BestBuy).
+```bash
+python scrape.py "https://www.nike.com/t/air-max-plus" --engine zyte
+```
+
+*(By default, Zyte uses a full headless browser. You can pass `--zyte-no-browser` to use fast HTTP mode for Zyte if JS is not needed).*
+
+## Output
+The script automatically creates two files:
+- A `.md` file containing the raw Markdown of the webpage (cleaned by Markdownify).
+- A `.json` file containing the structured data.

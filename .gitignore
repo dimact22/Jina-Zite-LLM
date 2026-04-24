@@ -2,6 +2,8 @@
 *.md
 !README.md
 *.json
+*.txt
+!prompt.txt
 
 # Ignore Python cache and environment variables
 __pycache__/
