@@ -1,9 +1,10 @@
 # Ignore all scraping result files
-*.md
-!README.md
-*.json
+results/*.md
+!results/README.md
+results/*.json
 *.txt
 !prompt.txt
+!prompt2.txt
 
 # Ignore Python cache and environment variables
 __pycache__/

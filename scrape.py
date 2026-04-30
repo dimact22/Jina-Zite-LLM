@@ -1,9 +1,9 @@
 """
-scrape.py  –  Universal AI Web Scraper
-========================================
+scrape.py  –  Universal AI Web Scraper & Persona Generator
+==========================================================
 
 A two-engine scraping pipeline that extracts structured JSON from any URL
-using an LLM (OpenRouter / Llama 3.3-70B).
+or multiple URLs using an LLM (OpenRouter / Llama 3.3-70B).
 
 Engines
 -------
@@ -13,38 +13,47 @@ Engines
   auto   – (default) Tries Jina first; falls back to Zyte when Jina fails
            or returns low-quality content.
 
+Key Features
+------------
+  - Context Stitching: Provide multiple URLs (e.g., Product + About Us) 
+    and the script will combine up to 250,000 characters of Markdown 
+    into a single context for deep LLM persona generation.
+  - Robust JSON: Strips conversational text and markdown fences natively.
+  - Clean Output: Automatically saves all outputs to the `results/` folder.
+
 Auto-fallback triggers
 ----------------------
   1. Jina returns an HTTP error (e.g. 403, 422).
   2. Jina response is < 500 characters (empty / placeholder page).
   3. Jina response contains bot-challenge keywords (Cloudflare, captcha, etc.).
-  4. LLM sets "target_audience" to "I don't know" (dynamic SPA content missed).
+  4. LLM quality check fails to find content (dynamic SPA content missed).
 
 Usage
 -----
   python scrape.py "https://example.com"
+  python scrape.py "https://product.com" "https://brand.com/about" --prompt prompt2.txt
   python scrape.py "https://example.com" --engine zyte
-  python scrape.py "https://example.com" --engine zyte --zyte-no-browser
-  python scrape.py --engine jina           # will prompt for URL
 
 Environment variables  (put these in a .env file)
 --------------------------------------------------
   OPENROUTER_API_KEY  – https://openrouter.ai
-  JINA_API_KEY        – https://jina.ai  (optional but increases rate limits)
+  JINA_API_KEY        – https://jina.ai  (increases rate limits & stability)
   ZYTE_API_KEY        – https://app.zyte.com
 
 Dependencies
 ------------
-  pip install requests markdownify beautifulsoup4 python-dotenv
+  pip install -r requirements.txt
 """
 
 import os
 import sys
 import time
+import base64
 import argparse
 import requests
 import json
 import re
+from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -184,7 +193,7 @@ def scrape_with_zyte(url: str, use_browser: bool = True) -> str:
         ZYTE_API_URL,
         auth=(ZYTE_API_KEY, ""),
         json=payload,
-        timeout=60,
+        timeout=120,
     )
     response.raise_for_status()
     data = response.json()
@@ -192,6 +201,10 @@ def scrape_with_zyte(url: str, use_browser: bool = True) -> str:
     raw_html = data.get("browserHtml" if use_browser else "httpResponseBody") or ""
     if not raw_html:
         return ""
+
+    # Zyte returns httpResponseBody as base64-encoded string
+    if not use_browser:
+        raw_html = base64.b64decode(raw_html).decode("utf-8", errors="replace")
 
     # 1. Strip noise tags
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -217,7 +230,7 @@ def scrape_with_zyte(url: str, use_browser: bool = True) -> str:
 @with_retry(max_retries=3, delay_sec=2)
 def extract_data_with_openrouter(markdown_content: str, instruction_prompt: str) -> str:
     """Send scraped Markdown + prompt to OpenRouter (Llama 3.3-70B) and return JSON."""
-    MAX_CHARS = 100_000
+    MAX_CHARS = 250_000
     if len(markdown_content) > MAX_CHARS:
         print(
             f"Warning: Content too long ({len(markdown_content):,} chars). "
@@ -232,9 +245,12 @@ def extract_data_with_openrouter(markdown_content: str, instruction_prompt: str)
         "model": "meta-llama/llama-3.3-70b-instruct",
         "messages": [
             {
+                "role": "system",
+                "content": instruction_prompt,
+            },
+            {
                 "role": "user",
                 "content": (
-                    f"{instruction_prompt}\n\n"
                     f"Here is the scraped Markdown content from the webpage:\n\n"
                     f"{markdown_content}"
                 ),
@@ -254,7 +270,19 @@ def extract_data_with_openrouter(markdown_content: str, instruction_prompt: str)
         timeout=120,
     )
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    raw_response = response.json()["choices"][0]["message"]["content"]
+    
+    # Robustly extract JSON even if LLM adds conversational text or markdown fences
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_response, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1)
+        
+    start = raw_response.find('{')
+    end = raw_response.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return raw_response[start:end+1]
+        
+    return raw_response
 
 
 # ──────────────── Jina Quality Check ────────────────
@@ -276,13 +304,63 @@ def is_jina_blocked(text: str) -> bool:
     return any(phrase in text_lower for phrase in block_phrases)
 
 
+def get_markdown_for_url(url: str, engine: str, use_browser: bool, instruction_prompt: str) -> tuple[str, bool, str]:
+    """Returns (markdown_content, used_zyte_fallback, optional_json_text_if_already_computed)"""
+    if engine == "jina":
+        return scrape_with_jina(url), False, ""
+    elif engine == "zyte":
+        return scrape_with_zyte(url, use_browser=use_browser), True, ""
+    else:  # auto
+        print(f"[Auto] Trying Jina first for {url} ...", file=sys.stderr)
+        jina_failed = False
+        md = ""
+        json_text = ""
+        
+        try:
+            md = scrape_with_jina(url)
+
+            if is_jina_blocked(md):
+                print(f"[Auto] Jina hit a bot-protection / captcha page for {url}.", file=sys.stderr)
+                jina_failed = True
+            else:
+                print(f"[Auto] Analyzing Jina content for {url} with LLM to verify quality...", file=sys.stderr)
+                json_text = extract_data_with_openrouter(md, instruction_prompt)
+
+                try:
+                    parsed = json.loads(json_text)
+                    target_aud = parsed.get("target_audience")
+                    if target_aud == "I don't know" or target_aud == ["-"] or target_aud == "-":
+                        print(
+                            f"[Auto] LLM returned empty/unknown for target_audience – "
+                            f"likely dynamic/SPA content missed by Jina.",
+                            file=sys.stderr,
+                        )
+                        jina_failed = True
+                    else:
+                        print(f"[Auto] Jina successfully extracted data for {url}!", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"[Auto] LLM returned invalid JSON on Jina pass.", file=sys.stderr)
+                    jina_failed = True
+
+        except requests.exceptions.RequestException as e:
+            print(f"[Auto] Jina HTTP error: {e}", file=sys.stderr)
+            jina_failed = True
+
+        if jina_failed:
+            print(f"\n[--> FALLBACK: Switching to Zyte for {url} <--]", file=sys.stderr)
+            md = scrape_with_zyte(url, use_browser=use_browser)
+            return md, True, ""
+            
+        return md, False, json_text
+
+
 # ──────────────── Main ────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Universal AI Web Scraper – extracts structured JSON from any URL."
+        description="Universal AI Web Scraper – extracts structured JSON from any URL(s)."
     )
-    parser.add_argument("url", nargs="?", help="URL to scrape")
+    parser.add_argument("urls", nargs="*", help="One or more URLs to scrape")
     parser.add_argument(
         "--engine",
         choices=["auto", "jina", "zyte"],
@@ -294,22 +372,28 @@ def main() -> None:
         action="store_true",
         help="Use Zyte's httpResponseBody instead of full browser rendering (faster).",
     )
+    parser.add_argument(
+        "--prompt",
+        default="prompt.txt",
+        help="Prompt file to use (default: prompt.txt). Use prompt2.txt for persona extraction.",
+    )
     args = parser.parse_args()
 
-    # Resolve URL
-    target_url: str = args.url or ""
-    if not target_url:
+    # Resolve URLs
+    target_urls = args.urls
+    if not target_urls:
         try:
-            target_url = input("Enter the URL to scrape: ").strip()
+            user_input = input("Enter the URLs to scrape (separated by space): ").strip()
+            if user_input:
+                target_urls = user_input.split()
         except EOFError:
-            target_url = ""
+            pass
 
-    if not target_url:
-        print("Error: No URL provided. Exiting.", file=sys.stderr)
+    if not target_urls:
+        print("Error: No URLs provided. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    if not target_url.startswith(("http://", "https://")):
-        target_url = "https://" + target_url
+    target_urls = [url if url.startswith(("http://", "https://")) else "https://" + url for url in target_urls]
 
     # Validate required keys early
     check_required_keys(("OPENROUTER_API_KEY", OPENROUTER_API_KEY))
@@ -317,80 +401,62 @@ def main() -> None:
         check_required_keys(("ZYTE_API_KEY", ZYTE_API_KEY))
 
     # Read prompt
-    instruction_prompt = read_prompt(PROMPT_FILE)
+    instruction_prompt = read_prompt(args.prompt)
     use_browser = not args.zyte_no_browser
 
     # ── Extraction pipeline ──
+    combined_md = ""
+    json_text = ""
+
     try:
-        md = ""
-        json_text = "{}"
+        md_parts = []
+        precomputed_json = ""
+        
+        for url in target_urls:
+            md, used_zyte, j_text = get_markdown_for_url(url, args.engine, use_browser, instruction_prompt)
+            md_parts.append(f"# SOURCE URL: {url}\n\n{md}\n\n" + "="*40 + "\n")
+            # If we only have 1 URL and it was successfully parsed in auto mode, we can reuse the JSON
+            if not precomputed_json and j_text and len(target_urls) == 1:
+                precomputed_json = j_text
 
-        if args.engine == "jina":
-            md = scrape_with_jina(target_url)
-            json_text = extract_data_with_openrouter(md, instruction_prompt)
-            print("Extraction finished (Jina only).", file=sys.stderr)
+        combined_md = "\n".join(md_parts)
 
-        elif args.engine == "zyte":
-            md = scrape_with_zyte(target_url, use_browser=use_browser)
-            json_text = extract_data_with_openrouter(md, instruction_prompt)
-            print("Extraction finished (Zyte only).", file=sys.stderr)
-
-        else:  # auto
-            print("[Auto] Trying Jina first ...", file=sys.stderr)
-            jina_failed = False
-
-            try:
-                md = scrape_with_jina(target_url)
-
-                if is_jina_blocked(md):
-                    print("[Auto] Jina hit a bot-protection / captcha page.", file=sys.stderr)
-                    jina_failed = True
-                else:
-                    print("[Auto] Analyzing Jina content with LLM ...", file=sys.stderr)
-                    json_text = extract_data_with_openrouter(md, instruction_prompt)
-
-                    try:
-                        parsed = json.loads(json_text)
-                        if parsed.get("target_audience") == "I don't know":
-                            print(
-                                "[Auto] LLM returned 'I don't know' for target_audience – "
-                                "likely dynamic/SPA content missed by Jina.",
-                                file=sys.stderr,
-                            )
-                            jina_failed = True
-                        else:
-                            print("[Auto] Jina successfully extracted the required data!", file=sys.stderr)
-                    except json.JSONDecodeError:
-                        print("[Auto] LLM returned invalid JSON on Jina pass.", file=sys.stderr)
-                        jina_failed = True
-
-            except requests.exceptions.RequestException as e:
-                print(f"[Auto] Jina HTTP error: {e}", file=sys.stderr)
-                jina_failed = True
-
-            if jina_failed:
-                print("\n[--> FALLBACK: Switching to Zyte <--]", file=sys.stderr)
-                md = scrape_with_zyte(target_url, use_browser=use_browser)
-                print("[Auto] Analyzing Zyte content with LLM ...", file=sys.stderr)
-                json_text = extract_data_with_openrouter(md, instruction_prompt)
+        if len(target_urls) == 1 and precomputed_json:
+            json_text = precomputed_json
+        else:
+            print("\nAnalyzing combined content with LLM ...", file=sys.stderr)
+            json_text = extract_data_with_openrouter(combined_md, instruction_prompt)
 
     except Exception as e:
         print(f"Fatal: scraping failed – {e}", file=sys.stderr)
         sys.exit(1)
 
     # Save Markdown
-    md_filename = get_safe_filename(target_url, ".md")
+    output_dir = "results"
+    os.makedirs(output_dir, exist_ok=True)
+
+    if len(target_urls) > 1:
+        base_name = f"multi_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        md_filename = os.path.join(output_dir, base_name + ".md")
+        json_filename = os.path.join(output_dir, base_name + ".json")
+    else:
+        md_filename = os.path.join(output_dir, get_safe_filename(target_urls[0], ".md"))
+        json_filename = os.path.join(output_dir, get_safe_filename(target_urls[0], ".json"))
+
     try:
         with open(md_filename, "w", encoding="utf-8") as f:
-            f.write(md)
+            f.write(combined_md)
         print(f"Saved Markdown → '{md_filename}'", file=sys.stderr)
     except OSError as e:
         print(f"Warning: Could not save Markdown: {e}", file=sys.stderr)
 
     # Save & print JSON
+    if not json_text:
+        print("Error: No JSON output was produced. Scraping may have failed.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         parsed_json = json.loads(json_text)
-        json_filename = get_safe_filename(target_url, ".json")
         with open(json_filename, "w", encoding="utf-8") as f:
             json.dump(parsed_json, f, indent=4, ensure_ascii=False)
         print(f"\n--- Extracted data saved → '{json_filename}' ---", file=sys.stderr)
