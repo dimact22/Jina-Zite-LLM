@@ -5,6 +5,7 @@ results/*.json
 *.txt
 !prompt.txt
 !prompt2.txt
+!requirements.txt
 
 # Ignore Python cache and environment variables
 __pycache__/
